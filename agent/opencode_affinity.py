@@ -3,7 +3,8 @@
 OpenCode (opencode.ai Zen/Go/free relay) pins requests that share an
 ``x-opencode-session`` value to the same upstream backend, which is what
 keeps its prompt cache warm across the turns of one conversation. The value
-uses OpenCode's session identifier format and stays consistent per conversation.
+uses a persisted OpenCode-format identifier for free-tier access. Paid Zen/Go
+requests retain Hermes's original routing scope and client identity.
 Its routing scope is resolved like the other affinity hints Hermes already sends
 (OpenRouter's sticky ``session_id``, xAI's ``x-grok-conv-id``): the
 host-declared routing scope first, then the ambient conversation root, then
@@ -17,43 +18,63 @@ so the header cannot drift per code path.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
+import sqlite3
 import threading
 import time
+from contextlib import closing
 from typing import Any, Optional
 
 OPENCODE_SESSION_HEADER = "x-opencode-session"
 OPENCODE_USER_AGENT = "opencode/1.18.31"
 _SESSION_PATTERN = re.compile(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}\Z")
-_SESSION_IDS: dict[str, str] = {}
 _SESSION_LOCK = threading.Lock()
 _LAST_TIMESTAMP = 0
 _COUNTER = 0
 
 
 def opencode_session_id(scope: str) -> str:
-    """Mint one official-format descending ID per routing scope, for this process.
+    """Reuse a persisted official-format ID for this profile's routing scope.
 
-    Matches packages/opencode/src/id/id.ts: complemented milliseconds * 4096
-    plus counter, six big-endian bytes, then fourteen random base62 characters.
-    Keep the mapping for the process lifetime so auxiliary calls and retries
-    never change the conversation's relay affinity. Native IDs pass through.
+    SQLite's unique scope key and INSERT OR IGNORE make simultaneous processes
+    agree on one ID. Store a scope hash rather than the original routing key.
+    Native OpenCode IDs already carry their identity and pass through.
     """
     if _SESSION_PATTERN.fullmatch(scope):
         return scope
+    from hermes_constants import get_hermes_home, mkdir_under_hermes_home
+
+    home = mkdir_under_hermes_home(get_hermes_home())
+    scope_hash = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    with closing(sqlite3.connect(home / "opencode_sessions.db", timeout=10)) as db, db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS sessions "
+            "(scope_hash TEXT PRIMARY KEY, session_id TEXT NOT NULL)"
+        )
+        row = db.execute("SELECT session_id FROM sessions WHERE scope_hash = ?", (scope_hash,)).fetchone()
+        if row is None:
+            db.execute(
+                "INSERT OR IGNORE INTO sessions (scope_hash, session_id) VALUES (?, ?)",
+                (scope_hash, _new_opencode_session_id()),
+            )
+            row = db.execute("SELECT session_id FROM sessions WHERE scope_hash = ?", (scope_hash,)).fetchone()
+        return row[0]
+
+
+def _new_opencode_session_id() -> str:
+    """OpenCode's descending milliseconds/counter encoding and base62 suffix."""
     global _LAST_TIMESTAMP, _COUNTER
     with _SESSION_LOCK:
-        if scope not in _SESSION_IDS:
-            now = time.time_ns() // 1_000_000
-            if now != _LAST_TIMESTAMP:
-                _LAST_TIMESTAMP, _COUNTER = now, 0
-            _COUNTER += 1
-            encoded = (~(now * 0x1000 + _COUNTER)) & ((1 << 48) - 1)
-            alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-            suffix = "".join(alphabet[b % 62] for b in secrets.token_bytes(14))
-            _SESSION_IDS[scope] = f"ses_{encoded:012x}{suffix}"
-        return _SESSION_IDS[scope]
+        now = time.time_ns() // 1_000_000
+        if now != _LAST_TIMESTAMP:
+            _LAST_TIMESTAMP, _COUNTER = now, 0
+        _COUNTER += 1
+        encoded = (~(now * 0x1000 + _COUNTER)) & ((1 << 48) - 1)
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        suffix = "".join(alphabet[b % 62] for b in secrets.token_bytes(14))
+        return f"ses_{encoded:012x}{suffix}"
 
 
 def is_opencode_target(provider: Optional[str], base_url: Optional[str]) -> bool:
@@ -81,8 +102,10 @@ def opencode_session_headers(
     provider: Optional[str],
     base_url: Optional[str],
     session_id: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> dict[str, str]:
-    """Return official client/session metadata for OpenCode targets, else ``{}``."""
+    """Relay affinity for all OpenCode targets; compatibility metadata only for free access."""
     if not is_opencode_target(provider, base_url):
         return {}
     try:
@@ -106,6 +129,20 @@ def opencode_session_headers(
         )
     except Exception:
         key = str(session_id or "")
+    from hermes_cli.models import (
+        OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER,
+        _opencode_free_known_model_slugs,
+        normalize_opencode_model_id,
+        opencode_provider_family,
+    )
+
+    free_access = (
+        opencode_provider_family(provider) == "opencode-free"
+        or api_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
+        or normalize_opencode_model_id(provider, model).lower() in _opencode_free_known_model_slugs()
+    )
+    if not free_access:
+        return {OPENCODE_SESSION_HEADER: key} if key else {}
     return {
         "User-Agent": OPENCODE_USER_AGENT,
         "x-opencode-client": "cli",
@@ -118,13 +155,15 @@ def merge_opencode_session_headers(
     provider: Optional[str],
     base_url: Optional[str],
     session_id: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> dict[str, Any]:
     """Merge the affinity header into ``kwargs["extra_headers"]`` (in place).
 
     Existing per-request headers win, so a caller-pinned value is preserved.
     Non-OpenCode targets are left untouched.
     """
-    headers = opencode_session_headers(provider, base_url, session_id)
+    headers = opencode_session_headers(provider, base_url, session_id, model, api_key)
     if headers:
         existing = kwargs.get("extra_headers")
         merged = dict(existing) if isinstance(existing, dict) else {}

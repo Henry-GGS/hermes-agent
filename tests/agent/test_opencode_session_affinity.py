@@ -41,14 +41,22 @@ def _agent(provider, model, base_url, api_mode=None):
         ("opencode-go", "minimax-m2.7", "https://opencode.ai/zen/go/v1", "anthropic_messages"),
         ("opencode-free", "nemotron-3.5-lightning-free", "https://opencode.ai/zen/v1", None),
         ("custom", "glm-5", "https://opencode.ai/zen/go/v1", None),  # URL-only detection
+        ("opencode-zen", "muse-spark-1.3-contributor-free", "https://opencode.ai/zen/v1", None),
+        ("custom", "muse-spark-1.3-contributor-free", "https://opencode.ai/zen/v1", None),
     ],
 )
 def test_main_turn_sends_stable_session_header_on_every_transport(provider, model, base_url, api_mode):
     agent = _agent(provider, model, base_url, api_mode)
     first = build_api_kwargs(agent, _MSGS)["extra_headers"]["x-opencode-session"]
     second = build_api_kwargs(agent, _MSGS)["extra_headers"]["x-opencode-session"]
-    assert first == second == opencode_session_id("sess-affinity-1")
-    assert build_api_kwargs(agent, _MSGS)["extra_headers"]["User-Agent"] == OPENCODE_USER_AGENT
+    headers = build_api_kwargs(agent, _MSGS)["extra_headers"]
+    if provider == "opencode-free" or model == "muse-spark-1.3-contributor-free":
+        assert first == second == opencode_session_id("sess-affinity-1")
+        assert headers["User-Agent"] == OPENCODE_USER_AGENT
+    else:
+        assert first == second == "sess-affinity-1"
+        assert "User-Agent" not in headers
+        assert "x-opencode-client" not in headers
 
     other = _agent("openrouter", "anthropic/claude-sonnet-4.6", "https://openrouter.ai/api/v1")
     assert "x-opencode-session" not in (build_api_kwargs(other, _MSGS).get("extra_headers") or {})
@@ -60,7 +68,12 @@ def test_auxiliary_calls_share_the_main_turn_session_key():
     )
     try:
         kwargs = aux._build_call_kwargs("opencode-go", "glm-5", _MSGS, base_url="https://opencode.ai/zen/go/v1")
-        assert kwargs["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-affinity-1")
+        assert kwargs["extra_headers"]["x-opencode-session"] == "sess-affinity-1"
+        assert "User-Agent" not in kwargs["extra_headers"]
+        free_kwargs = aux._build_call_kwargs("opencode-zen", "muse-spark-1.3-contributor-free", _MSGS,
+                                             base_url="https://opencode.ai/zen/v1")
+        assert free_kwargs["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-affinity-1")
+        assert free_kwargs["extra_headers"]["User-Agent"] == OPENCODE_USER_AGENT
         other = aux._build_call_kwargs("openrouter", "x", _MSGS, base_url="https://openrouter.ai/api/v1")
         assert "x-opencode-session" not in (other.get("extra_headers") or {})
     finally:
@@ -120,7 +133,7 @@ def test_sync_out_of_turn_call_binds_the_explicit_main_runtime_session(monkeypat
 
     aux.call_llm(task="title_generation", main_runtime=_OPENCODE_RUNTIME, messages=_MSGS)
 
-    assert captured["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-affinity-1")
+    assert captured["extra_headers"]["x-opencode-session"] == "sess-affinity-1"
     assert aux._RUNTIME_MAIN_CONTEXT.get() is None  # the explicit binding does not leak past the call
 
 
@@ -131,7 +144,7 @@ def test_async_out_of_turn_call_binds_the_explicit_main_runtime_session(monkeypa
 
     asyncio.run(aux.async_call_llm(task="approval", main_runtime=_OPENCODE_RUNTIME, messages=_MSGS))
 
-    assert captured["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-affinity-1")
+    assert captured["extra_headers"]["x-opencode-session"] == "sess-affinity-1"
     assert aux._RUNTIME_MAIN_CONTEXT.get() is None
 
 
@@ -149,16 +162,16 @@ def test_tui_gateway_oneshot_runtime_snapshot_carries_the_session(monkeypatch, o
 
     aux.call_llm(task="title_generation", main_runtime=_main_runtime_from_agent(agent), messages=_MSGS)
 
-    assert captured["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-desktop-1")
+    assert captured["extra_headers"]["x-opencode-session"] == "sess-desktop-1"
 
 
-def test_session_ids_follow_official_encoding_and_remain_scoped(monkeypatch):
+def test_session_ids_follow_official_encoding_and_remain_scoped(monkeypatch, tmp_path):
     import re
     import agent.opencode_affinity as affinity
 
     timestamp = 1_789_646_400_000
     monkeypatch.setattr(affinity.time, "time_ns", lambda: timestamp * 1_000_000)
-    monkeypatch.setattr(affinity, "_SESSION_IDS", {})
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(affinity, "_LAST_TIMESTAMP", 0)
     monkeypatch.setattr(affinity, "_COUNTER", 0)
     first = affinity.opencode_session_id("conversation-a")
@@ -171,3 +184,36 @@ def test_session_ids_follow_official_encoding_and_remain_scoped(monkeypatch):
     assert ((~int(first[4:16], 16)) & mask) == ((timestamp * 4096 + 1) & mask)
     assert ((~int(second[4:16], 16)) & mask) == ((timestamp * 4096 + 2) & mask)
     assert affinity.opencode_session_headers("opencode-free", None)["x-opencode-session"]
+
+
+def test_session_identity_survives_process_restarts_and_stays_profile_scoped(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    script = (
+        "import json; from agent.opencode_affinity import opencode_session_headers; "
+        "print(json.dumps([opencode_session_headers('opencode-free', None, scope)"
+        "['x-opencode-session'] for scope in ('conversation-a', 'conversation-b')]))"
+    )
+
+    def read_ids(home):
+        return json.loads(subprocess.check_output(
+            [sys.executable, "-c", script],
+            env={**os.environ, "HERMES_HOME": str(home)},
+            text=True,
+            timeout=30,
+        ))
+
+    home_a, home_b = tmp_path / "home-a", tmp_path / "home-b"
+    # Cold simultaneous starts must converge on one persisted mapping.
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        results = list(workers.map(read_ids, [home_a] * 3))
+    first = results[0]
+    assert all(ids == first for ids in results)
+    assert first[0] != first[1]
+    other_profile = read_ids(home_b)
+    assert set(first).isdisjoint(other_profile)
+    assert read_ids(home_a) == first  # A -> B -> A, with a fresh process each time
