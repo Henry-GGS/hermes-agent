@@ -63,9 +63,8 @@ def test_opencode_free_blanks_authorization_header(mock_openai):
 
 
 @patch("agent.process_bootstrap.OpenAI")
-def test_opencode_free_sends_hermes_attribution(mock_openai):
-    """Keyless requests still identify as Hermes (attribution headers match
-    the opencode zen/go profiles)."""
+def test_opencode_free_sends_opencode_client_metadata(mock_openai):
+    """Keyless client defaults carry accepted client and session metadata."""
     mock_openai.return_value = MagicMock()
     create_openai_client(
         _FakeAgent(api_key="opencode-zen-free-keyless"),
@@ -75,7 +74,10 @@ def test_opencode_free_sends_hermes_attribution(mock_openai):
     )
     headers = _zen_call_headers(mock_openai)
     assert headers.get("X-Title") == "Hermes Agent"
-    assert str(headers.get("User-Agent", "")).startswith("HermesAgent/")
+    from agent.opencode_affinity import OPENCODE_USER_AGENT, _SESSION_PATTERN
+    assert headers.get("User-Agent") == OPENCODE_USER_AGENT
+    assert headers.get("x-opencode-client") == "cli"
+    assert _SESSION_PATTERN.fullmatch(headers["x-opencode-session"])
 
 
 @patch("agent.process_bootstrap.OpenAI")
@@ -125,3 +127,7 @@ def test_async_aux_wrapper_keeps_keyless_authorization_blank():
         openai._models.FinalRequestOptions.construct(method="post", url="/chat/completions", json_data={})
     )
     assert request.headers.get("authorization") == ""
+    from agent.opencode_affinity import OPENCODE_USER_AGENT, _SESSION_PATTERN
+    assert request.headers["user-agent"] == OPENCODE_USER_AGENT
+    assert request.headers["x-opencode-client"] == "cli"
+    assert _SESSION_PATTERN.fullmatch(request.headers["x-opencode-session"])

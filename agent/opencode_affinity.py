@@ -3,8 +3,8 @@
 OpenCode (opencode.ai Zen/Go/free relay) pins requests that share an
 ``x-opencode-session`` value to the same upstream backend, which is what
 keeps its prompt cache warm across the turns of one conversation. The value
-only has to be opaque and consistent per conversation, so it is derived the
-same way as the other conversation-affinity hints Hermes already sends
+uses OpenCode's session identifier format and stays consistent per conversation.
+Its routing scope is resolved like the other affinity hints Hermes already sends
 (OpenRouter's sticky ``session_id``, xAI's ``x-grok-conv-id``): the
 host-declared routing scope first, then the ambient conversation root, then
 the physical session id — normalized through ``_cache_scope_from_session_id``
@@ -17,9 +17,43 @@ so the header cannot drift per code path.
 
 from __future__ import annotations
 
+import re
+import secrets
+import threading
+import time
 from typing import Any, Optional
 
 OPENCODE_SESSION_HEADER = "x-opencode-session"
+OPENCODE_USER_AGENT = "opencode/1.18.31"
+_SESSION_PATTERN = re.compile(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}\Z")
+_SESSION_IDS: dict[str, str] = {}
+_SESSION_LOCK = threading.Lock()
+_LAST_TIMESTAMP = 0
+_COUNTER = 0
+
+
+def opencode_session_id(scope: str) -> str:
+    """Mint one official-format descending ID per routing scope, for this process.
+
+    Matches packages/opencode/src/id/id.ts: complemented milliseconds * 4096
+    plus counter, six big-endian bytes, then fourteen random base62 characters.
+    Keep the mapping for the process lifetime so auxiliary calls and retries
+    never change the conversation's relay affinity. Native IDs pass through.
+    """
+    if _SESSION_PATTERN.fullmatch(scope):
+        return scope
+    global _LAST_TIMESTAMP, _COUNTER
+    with _SESSION_LOCK:
+        if scope not in _SESSION_IDS:
+            now = time.time_ns() // 1_000_000
+            if now != _LAST_TIMESTAMP:
+                _LAST_TIMESTAMP, _COUNTER = now, 0
+            _COUNTER += 1
+            encoded = (~(now * 0x1000 + _COUNTER)) & ((1 << 48) - 1)
+            alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            suffix = "".join(alphabet[b % 62] for b in secrets.token_bytes(14))
+            _SESSION_IDS[scope] = f"ses_{encoded:012x}{suffix}"
+        return _SESSION_IDS[scope]
 
 
 def is_opencode_target(provider: Optional[str], base_url: Optional[str]) -> bool:
@@ -48,7 +82,7 @@ def opencode_session_headers(
     base_url: Optional[str],
     session_id: Optional[str] = None,
 ) -> dict[str, str]:
-    """Return ``{"x-opencode-session": <key>}`` for OpenCode targets, else ``{}``."""
+    """Return official client/session metadata for OpenCode targets, else ``{}``."""
     if not is_opencode_target(provider, base_url):
         return {}
     try:
@@ -72,7 +106,11 @@ def opencode_session_headers(
         )
     except Exception:
         key = str(session_id or "")
-    return {OPENCODE_SESSION_HEADER: key} if key else {}
+    return {
+        "User-Agent": OPENCODE_USER_AGENT,
+        "x-opencode-client": "cli",
+        OPENCODE_SESSION_HEADER: opencode_session_id(key or ""),
+    }
 
 
 def merge_opencode_session_headers(

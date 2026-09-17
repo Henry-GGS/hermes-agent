@@ -9,6 +9,7 @@ import pytest
 
 from agent import auxiliary_client as aux
 from agent.chat_completion_helpers import build_api_kwargs
+from agent.opencode_affinity import OPENCODE_USER_AGENT, opencode_session_id
 from run_agent import AIAgent
 
 _MSGS = [{"role": "user", "content": "hi"}]
@@ -46,7 +47,8 @@ def test_main_turn_sends_stable_session_header_on_every_transport(provider, mode
     agent = _agent(provider, model, base_url, api_mode)
     first = build_api_kwargs(agent, _MSGS)["extra_headers"]["x-opencode-session"]
     second = build_api_kwargs(agent, _MSGS)["extra_headers"]["x-opencode-session"]
-    assert first == second == "sess-affinity-1"
+    assert first == second == opencode_session_id("sess-affinity-1")
+    assert build_api_kwargs(agent, _MSGS)["extra_headers"]["User-Agent"] == OPENCODE_USER_AGENT
 
     other = _agent("openrouter", "anthropic/claude-sonnet-4.6", "https://openrouter.ai/api/v1")
     assert "x-opencode-session" not in (build_api_kwargs(other, _MSGS).get("extra_headers") or {})
@@ -58,7 +60,7 @@ def test_auxiliary_calls_share_the_main_turn_session_key():
     )
     try:
         kwargs = aux._build_call_kwargs("opencode-go", "glm-5", _MSGS, base_url="https://opencode.ai/zen/go/v1")
-        assert kwargs["extra_headers"]["x-opencode-session"] == "sess-affinity-1"
+        assert kwargs["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-affinity-1")
         other = aux._build_call_kwargs("openrouter", "x", _MSGS, base_url="https://openrouter.ai/api/v1")
         assert "x-opencode-session" not in (other.get("extra_headers") or {})
     finally:
@@ -118,7 +120,7 @@ def test_sync_out_of_turn_call_binds_the_explicit_main_runtime_session(monkeypat
 
     aux.call_llm(task="title_generation", main_runtime=_OPENCODE_RUNTIME, messages=_MSGS)
 
-    assert captured["extra_headers"]["x-opencode-session"] == "sess-affinity-1"
+    assert captured["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-affinity-1")
     assert aux._RUNTIME_MAIN_CONTEXT.get() is None  # the explicit binding does not leak past the call
 
 
@@ -129,7 +131,7 @@ def test_async_out_of_turn_call_binds_the_explicit_main_runtime_session(monkeypa
 
     asyncio.run(aux.async_call_llm(task="approval", main_runtime=_OPENCODE_RUNTIME, messages=_MSGS))
 
-    assert captured["extra_headers"]["x-opencode-session"] == "sess-affinity-1"
+    assert captured["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-affinity-1")
     assert aux._RUNTIME_MAIN_CONTEXT.get() is None
 
 
@@ -147,4 +149,25 @@ def test_tui_gateway_oneshot_runtime_snapshot_carries_the_session(monkeypatch, o
 
     aux.call_llm(task="title_generation", main_runtime=_main_runtime_from_agent(agent), messages=_MSGS)
 
-    assert captured["extra_headers"]["x-opencode-session"] == "sess-desktop-1"
+    assert captured["extra_headers"]["x-opencode-session"] == opencode_session_id("sess-desktop-1")
+
+
+def test_session_ids_follow_official_encoding_and_remain_scoped(monkeypatch):
+    import re
+    import agent.opencode_affinity as affinity
+
+    timestamp = 1_789_646_400_000
+    monkeypatch.setattr(affinity.time, "time_ns", lambda: timestamp * 1_000_000)
+    monkeypatch.setattr(affinity, "_SESSION_IDS", {})
+    monkeypatch.setattr(affinity, "_LAST_TIMESTAMP", 0)
+    monkeypatch.setattr(affinity, "_COUNTER", 0)
+    first = affinity.opencode_session_id("conversation-a")
+    second = affinity.opencode_session_id("conversation-b")
+    assert re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", first)
+    assert affinity.opencode_session_id("conversation-a") == first
+    assert affinity.opencode_session_id(first) == first
+    assert first != second
+    mask = (1 << 48) - 1
+    assert ((~int(first[4:16], 16)) & mask) == ((timestamp * 4096 + 1) & mask)
+    assert ((~int(second[4:16], 16)) & mask) == ((timestamp * 4096 + 2) & mask)
+    assert affinity.opencode_session_headers("opencode-free", None)["x-opencode-session"]

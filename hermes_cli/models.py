@@ -2163,16 +2163,13 @@ _OPENCODE_FREE_LIVE_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
 def opencode_zen_free_headers() -> dict:
     """Client default_headers for anonymous Zen free-tier requests. ``Authorization: ""`` overrides the
     OpenAI SDK's ``Bearer <api_key>`` so the placeholder never reaches the wire (the relay 401s any
-    unknown bearer). Attribution headers mirror the opencode provider profile."""
-    try:
-        from hermes_cli import __version__ as _v
-    except Exception:
-        _v = "0"
+    unknown bearer). Client metadata uses the OpenCode-compatible format."""
+    from agent.opencode_affinity import opencode_session_headers
     return {
         "Authorization": "",
         "HTTP-Referer": "https://hermes-agent.nousresearch.com",
         "X-Title": "Hermes Agent",
-        "User-Agent": f"HermesAgent/{_v}"}
+        **opencode_session_headers("opencode-free", _OPENCODE_ZEN_FREE_BASE_URL)}
 
 
 def _fetch_opencode_free_models(
