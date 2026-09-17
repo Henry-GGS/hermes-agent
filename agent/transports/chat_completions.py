@@ -364,6 +364,8 @@ class ChatCompletionsTransport(ProviderTransport):
     # ``{alias: original}`` of the most recent request. ``None`` = no request recorded
     # (normalize-only call sites) -> static alias; ``{}`` = no aliases emitted.
     _last_wire_aliases: dict[str, str] | None = None
+    _last_free_aliases: dict[str, str] | None = None
+    _last_free_search_targets: dict[str, str] | None = None
 
     @property
     def api_mode(self) -> str:
@@ -393,6 +395,16 @@ class ChatCompletionsTransport(ProviderTransport):
         path below (is_kimi, is_openrouter, ...) is only reached for unregistered providers.
         """
         sanitized = self.convert_messages(messages, model=model)
+        from agent.opencode_affinity import is_opencode_free_target
+
+        profile = params.get("provider_profile")
+        provider = params.get("provider") or getattr(profile, "provider_id", None)
+        self._last_free_aliases, self._last_free_search_targets = {}, {}
+        if tools and is_opencode_free_target(provider, params.get("base_url"), model, params.get("api_key")):
+            from agent.opencode_free_tools import adapt_free_chat_tools, rewrite_free_chat_history
+
+            tools, self._last_free_aliases, self._last_free_search_targets = adapt_free_chat_tools(tools)
+            sanitized = rewrite_free_chat_history(sanitized, self._last_free_aliases, self._last_free_search_targets)
         _profile = params.get("provider_profile")
         if _profile:
             return self._build_kwargs_from_profile(_profile, model, sanitized, tools, params)
@@ -569,13 +581,18 @@ class ChatCompletionsTransport(ProviderTransport):
         name = getattr(tc_function, "name", None)
         if tc_function is None or name is None:
             return None
+        arguments = getattr(tc_function, "arguments", None)
+        if name in (self._last_free_search_targets or {}):
+            from agent.opencode_free_tools import bind_search_target
+
+            arguments = bind_search_target(arguments, self._last_free_search_targets[name])
+        name = (self._last_free_aliases or {}).get(name, name)
         # Reverse only aliases THIS request emitted; a real ``hermes_tool_search`` tool stays itself.
         alias_map = self._last_wire_aliases
         if alias_map is None:
             name = "tool_search" if name == _XAI_TOOL_SEARCH_ALIAS else name
         else:
             name = alias_map.get(name, name)
-        arguments = getattr(tc_function, "arguments", None)
         extra = _attr_or_model_extra(tc, "extra_content")
         return ToolCall(
             id=getattr(tc, "id", None), name=name, arguments="{}" if arguments is None else arguments,

@@ -129,6 +129,19 @@ def opencode_session_headers(
         )
     except Exception:
         key = str(session_id or "")
+    if not is_opencode_free_target(provider, base_url, model, api_key):
+        return {OPENCODE_SESSION_HEADER: key} if key else {}
+    return {
+        "User-Agent": OPENCODE_USER_AGENT,
+        "x-opencode-client": "cli",
+        OPENCODE_SESSION_HEADER: opencode_session_id(key or ""),
+    }
+
+
+def is_opencode_free_target(provider, base_url, model=None, api_key=None) -> bool:
+    """Use the same free-tier classification for session metadata and tool adaptation."""
+    if not is_opencode_target(provider, base_url):
+        return False
     from hermes_cli.models import (
         OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER,
         _opencode_free_known_model_slugs,
@@ -136,18 +149,11 @@ def opencode_session_headers(
         opencode_provider_family,
     )
 
-    free_access = (
+    return (
         opencode_provider_family(provider) == "opencode-free"
         or api_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
         or normalize_opencode_model_id(provider, model).lower() in _opencode_free_known_model_slugs()
     )
-    if not free_access:
-        return {OPENCODE_SESSION_HEADER: key} if key else {}
-    return {
-        "User-Agent": OPENCODE_USER_AGENT,
-        "x-opencode-client": "cli",
-        OPENCODE_SESSION_HEADER: opencode_session_id(key or ""),
-    }
 
 
 def merge_opencode_session_headers(

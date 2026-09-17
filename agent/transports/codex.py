@@ -492,6 +492,7 @@ class ResponsesApiTransport(ProviderTransport):
     _last_issuer_model: Optional[str] = None
     # ``{wire_alias: original}`` of the most recent build_kwargs. None = no request built (legacy map).
     _last_wire_aliases: Optional[dict[str, str]] = None
+    _last_free_search_targets: Optional[dict[str, str]] = None
 
     @property
     def api_mode(self) -> str:
@@ -580,6 +581,16 @@ class ResponsesApiTransport(ProviderTransport):
 
         reasoning_effort, reasoning_enabled = _resolve_reasoning(model, params)
         response_tools, self._last_wire_aliases = _alias_wire_tools(self.convert_tools(tools), params, is_xai_responses)
+        from agent.opencode_affinity import is_opencode_free_target
+
+        free_target = is_opencode_free_target(params.get("provider"), params.get("base_url"), model, params.get("api_key"))
+        self._last_free_search_targets = {}
+        if free_target and response_tools:
+            from agent.opencode_free_tools import adapt_free_tools
+
+            response_tools, self._last_wire_aliases, self._last_free_search_targets = adapt_free_tools(
+                response_tools, self._last_wire_aliases,
+            )
 
         # Lazy: provider plugins import this transport during model_metadata init.
         from agent.model_metadata import strip_codex_context_variant_suffix as _strip_ctx_variant
@@ -598,6 +609,12 @@ class ResponsesApiTransport(ProviderTransport):
             "store": False,
         }
         # ``tools`` MUST be omitted when empty: the openai SDK iterates it without a None guard.
+        if free_target:
+            from agent.opencode_free_tools import rewrite_free_history
+
+            kwargs["input"] = rewrite_free_history(
+                kwargs["input"], self._last_wire_aliases, self._last_free_search_targets,
+            )
         if response_tools:
             kwargs["tools"] = response_tools
             kwargs["tool_choice"] = "auto"
@@ -698,6 +715,11 @@ class ResponsesApiTransport(ProviderTransport):
                 }
                 has_fn = hasattr(tc, "function")
                 name = tc.function.name if has_fn else getattr(tc, "name", "")
+                arguments = tc.function.arguments if has_fn else getattr(tc, "arguments", "{}")
+                if name in (self._last_free_search_targets or {}):
+                    from agent.opencode_free_tools import bind_search_target
+
+                    arguments = bind_search_target(arguments, self._last_free_search_targets[name])
                 # Undo only aliases THIS request emitted; the legacy map is for normalize-only call sites.
                 if alias_map is None:
                     name = _LEGACY_ALIAS_FALLBACK.get(name, name)
@@ -705,7 +727,7 @@ class ResponsesApiTransport(ProviderTransport):
                     name = alias_map[name]
                 tool_calls.append(ToolCall(
                     id=tc.id if hasattr(tc, "id") else (name or None), name=name,
-                    arguments=tc.function.arguments if has_fn else getattr(tc, "arguments", "{}"),
+                    arguments=arguments,
                     provider_data=provider_data or None,
                 ))
 
